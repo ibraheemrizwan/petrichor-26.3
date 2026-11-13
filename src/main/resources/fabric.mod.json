@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "petrichor",
+  "version": "1.7.0+26.3.port.1",
+  "name": "Petrichor",
+  "description": "Fabric 26.3 port of petrichor",
+  "authors": [
+    "Pocky"
+  ],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.pockyl.petrichor.Petrichor"
+    ],
+    "client": [
+      "com.pockyl.petrichor.client.PetrichorClient"
+    ],
+    "fabric-gametest": [
+      "com.pockyl.petrichor.gametest.ModGameTests"
+    ],
+    "fabric-client-gametest": [
+      "com.pockyl.petrichor.gametest.ClientPortTest"
+    ]
+  },
+  "mixins": [
+    "petrichor.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "fabric-api": "*",
+    "minecraft": "~26.3",
+    "java": ">=25"
+  }
+}

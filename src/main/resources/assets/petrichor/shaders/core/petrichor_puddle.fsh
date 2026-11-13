@@ -1,0 +1,235 @@
+#version 330
+#extension GL_ARB_separate_shader_objects : require
+#include <petrichor:port_depth.glsl>
+
+layout(std140) uniform WeatherUniforms {
+    mat4 ModelViewMat;
+    mat4 ProjMat;
+    vec3 ChunkOffset;
+    vec4 ColorModulator;
+    float FogStart;
+    float FogEnd;
+    vec4 FogColor;
+    int FogShape;
+    float PetrichorTime;
+    vec3 SkyColor;
+    mat4 InvProjMat;
+    float Wetness;
+    float Coverage;
+    float RainAmount;
+    float Flow;
+    float SsrSteps;
+};
+
+#include <petrichor:port_fog.glsl>
+#include <petrichor:petrichor_noise.glsl>
+
+uniform sampler2D SceneColor;
+uniform sampler2D SceneDepth;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+layout(location = 0) in float vertexDistance;
+layout(location = 1) in vec2 worldUv;
+layout(location = 2) in vec4 vertexColor;
+layout(location = 3) in vec4 lightColor;
+layout(location = 4) in vec3 relativePos;
+layout(location = 5) in vec3 viewPos;
+layout(location = 6) in vec3 flow;
+
+layout(location = 0) out vec4 fragColor;
+
+// Slope of tiling value noise by central differences.
+vec2 noiseSlope(vec2 p, float period, float e) {
+    float dx = petrichor_noise(p + vec2(e, 0.0), period) - petrichor_noise(p - vec2(e, 0.0), period);
+    float dy = petrichor_noise(p + vec2(0.0, e), period) - petrichor_noise(p - vec2(0.0, e), period);
+    return vec2(dx, dy) / (2.0 * e);
+}
+
+// Rings spreading from rain drops on still water. One drop per half-block cell and cycle (a share of the cells active
+// depending on how hard it rains); each drop leaves a small dimple and a ring that widens to about half a block,
+// with a couple of crests behind its front, and fades as it grows. Returns the slope of the water surface.
+// uv is in blocks (wraps at 256, a whole number of cells).
+vec2 ripples(vec2 uv, float time, float amount) {
+    const float CELL = 0.5;
+    vec2 q = uv / CELL;
+    vec2 cell = floor(q);
+    vec2 slope = vec2(0.0);
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 c = cell + vec2(float(x), float(y));
+            vec2 key = mod(c, 512.0);
+            float period = 0.8 + petrichor_hash(key + 17.0) * 0.7;
+            float t = time / period + petrichor_hash(key);
+            float cycle = floor(t);
+            float age = fract(t);
+            if (petrichor_hash(key + vec2(mod(cycle, 61.0) * 7.0, 3.0)) > amount) {
+                continue;
+            }
+            vec2 center = c + 0.15 + 0.7 * vec2(petrichor_hash(key + vec2(mod(cycle, 53.0) * 0.37, 5.0)),
+                    petrichor_hash(key + vec2(9.0, mod(cycle, 47.0) * 0.53)));
+            vec2 d = (q - center) * CELL;
+            float dist = length(d);
+            // Height profile across the ring: a few crests under a narrow bell around the front.
+            float s0 = dist - age * 0.6;
+            const float WIDTH = 0.045;
+            const float K = 6.2832 / 0.05;
+            float bell = exp(-s0 * s0 / (WIDTH * WIDTH));
+            float dh = bell * (-2.0 * s0 / (WIDTH * WIDTH) * cos(K * s0) - K * sin(K * s0));
+            float fade = (1.0 - age) * (1.0 - age);
+            // The dimple where the drop went in, only right after it hit.
+            float dimple = exp(-dist * dist / 0.0016) * (1.0 - smoothstep(0.0, 0.12, age)) * -2.0 * dist / 0.0016;
+            slope += (dh * 0.0045 * fade + dimple * 0.004) * d / (dist + 1e-4);
+        }
+    }
+    return slope;
+}
+
+vec3 viewFromDepth(vec2 uv, float depth) {
+    vec4 ndc = vec4(uv * 2.0 - 1.0, petrichorClipDepth(depth), 1.0);
+    vec4 view = InvProjMat * ndc;
+    return view.xyz / view.w;
+}
+
+// Screen-space reflection: marches the reflected ray through the depth of the scene drawn so far.
+// Returns the reflected colour and the confidence of the hit (0 when the ray left the screen or hit nothing).
+vec4 traceReflection(vec3 origin, vec3 dir) {
+    if (SsrSteps < 1.0) {
+        return vec4(0.0);
+    }
+    float stepLength = 0.12 + length(origin) * 0.012;
+    vec3 point = origin + dir * stepLength;
+    vec3 previous = origin;
+    for (int i = 0; i < 64; i++) {
+        if (float(i) >= SsrSteps) {
+            break;
+        }
+        vec4 clip = ProjMat * vec4(point, 1.0);
+        if (clip.w <= 0.0) {
+            break;
+        }
+        vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            break;
+        }
+        float depth = texture(SceneDepth, uv).r;
+        if (depth > 0.000001) {
+            vec3 scene = viewFromDepth(uv, depth);
+            float behind = scene.z - point.z;
+            if (behind > 0.0 && behind < stepLength * 2.0 + 0.4) {
+                // Refine between the last point in front of the scene and the first one behind it.
+                vec3 a = previous;
+                vec3 b = point;
+                for (int r = 0; r < 5; r++) {
+                    vec3 m = (a + b) * 0.5;
+                    vec4 mc = ProjMat * vec4(m, 1.0);
+                    vec2 muv = mc.xy / mc.w * 0.5 + 0.5;
+                    vec3 ms = viewFromDepth(muv, texture(SceneDepth, muv).r);
+                    if (ms.z - m.z > 0.0) {
+                        b = m;
+                    } else {
+                        a = m;
+                    }
+                }
+                vec4 hc = ProjMat * vec4(b, 1.0);
+                vec2 huv = hc.xy / hc.w * 0.5 + 0.5;
+                vec2 edge = smoothstep(0.0, 0.08, huv) * smoothstep(1.0, 0.92, huv);
+                float confidence = edge.x * edge.y * (1.0 - float(i) / max(SsrSteps, 1.0) * 0.6);
+                return vec4(texture(SceneColor, huv).rgb, confidence);
+            }
+        }
+        previous = point;
+        stepLength *= 1.18;
+        point += dir * stepLength;
+    }
+    return vec4(0.0);
+}
+
+void main() {
+    // Puddle outline: the block-scale field from the terrain, broken up by warped noise into organic shapes.
+    vec2 warp = vec2(petrichor_noise(worldUv * 0.5, 128.0), petrichor_noise(worldUv * 0.5 + 37.0, 128.0)) - 0.5;
+    vec2 wp = worldUv + warp * 1.6;
+    float detail = petrichor_noise(wp, 256.0) * 0.55 + petrichor_noise(wp * 3.0, 768.0) * 0.3
+            + petrichor_noise(wp * 9.0, 2304.0) * 0.15;
+    float field = vertexColor.a + (detail - 0.5) * 0.34;
+    float threshold = 1.05 - Wetness * 0.62 * Coverage;
+    float aa = max(fwidth(field) * 1.2, 0.004);
+    // How wet this spot is relative to open ground (sheltered, freshly placed or drying). Partly wet ground is wet in
+    // patches with ragged edges, never along a straight line.
+    float edgeNoise = petrichor_noise(worldUv * 2.0 + 17.0, 512.0) * 0.6 + petrichor_noise(worldUv * 6.0, 1536.0) * 0.4;
+    float exposure = vertexColor.g;
+    float ragged = exposure + (edgeNoise - 0.5) * 0.7 * (1.0 - exposure * exposure);
+    float open = smoothstep(0.0, 0.9, ragged);
+    open = open * open * (3.0 - 2.0 * open);
+    float puddle = smoothstep(threshold - aa, threshold + aa, field) * smoothstep(0.6, 0.98, ragged);
+    float margin = smoothstep(threshold - 0.16, threshold, field) * (1.0 - puddle);
+    float wet = clamp(Wetness * 1.5, 0.0, 1.0) * open;
+
+    // Surface normal: still puddles with rain rings, running water on slopes, fine grain on wet ground. Rings
+    // smaller than a pixel only shimmer, so they fade out in the distance.
+    vec2 slope = vec2(0.0);
+    if (puddle > 0.0) {
+        float near = 1.0 - smoothstep(12.0, 40.0, vertexDistance);
+        if (near > 0.0) {
+            slope += ripples(worldUv, PetrichorTime, RainAmount) * puddle * near;
+        }
+    }
+    float flowAmount = clamp(flow.y, 0.0, 1.0) * Flow * (1.0 - puddle);
+    if (flowAmount > 0.01 && length(flow.xz) > 0.01) {
+        vec2 along = normalize(flow.xz);
+        vec2 across = vec2(-along.y, along.x);
+        vec2 fp = vec2(dot(worldUv, across) * 3.0, dot(worldUv, along) * 1.2 - PetrichorTime * 1.6);
+        vec2 s = noiseSlope(fp, 4096.0, 0.06);
+        slope += (across * s.x + along * s.y) * 0.08 * flowAmount;
+    }
+    slope += noiseSlope(worldUv * 9.0, 2304.0, 0.08) * 0.02 * (1.0 - puddle);
+    vec3 normal = normalize(vec3(-slope.x, 1.0, -slope.y));
+
+    vec3 toEye = normalize(-relativePos);
+    float facing = max(dot(normal, toEye), 0.0);
+    float fresnel = 0.12 + 0.88 * pow(1.0 - facing, 4.0);
+
+    // What the surface mirrors: the scene where the reflected ray finds it, the sky elsewhere.
+    vec3 reflectedWorld = reflect(-toEye, normal);
+    float skyLight = clamp(lightColor.b * 1.1, 0.05, 1.0);
+    vec3 sky = mix(FogColor.rgb, SkyColor, smoothstep(0.0, 0.6, reflectedWorld.y)) * skyLight;
+    vec3 viewNormal = normalize(mat3(ModelViewMat) * normal);
+    vec3 viewDir = normalize(viewPos);
+    vec4 traced = traceReflection(viewPos + viewNormal * 0.02, reflect(viewDir, viewNormal));
+    vec3 mirror = mix(sky, traced.rgb, traced.a);
+
+    // Puddles: shallow water over the ground. The ground shows through, darkened and tinted by the water, and the
+    // reflection lies on top, strongest at grazing angles.
+    float transmit = (1.0 - fresnel) * 0.5;
+    vec3 tint = mix(vec3(0.27, 0.29, 0.31), vec3(0.36, 0.29, 0.21), vertexColor.r) * lightColor.rgb * 0.12;
+    float puddleAlpha = 1.0 - transmit;
+    vec3 puddleColor = (mirror * fresnel + tint * (1.0 - fresnel) * 0.5) / max(puddleAlpha, 0.001);
+
+    // Wet ground: darker, with a soft sheen of the same reflection at grazing angles.
+    float darken = wet * (0.22 + 0.14 * margin) + flowAmount * 0.1;
+    float gloss = fresnel * wet * (0.35 + 0.4 * margin + 0.4 * flowAmount);
+    float wetAlpha = 1.0 - (1.0 - darken) * (1.0 - gloss);
+    vec3 wetColor = mirror * gloss / max(wetAlpha, 0.001);
+
+    vec4 color;
+    color.a = mix(wetAlpha, puddleAlpha, puddle);
+    color.rgb = mix(wetColor, puddleColor, puddle);
+    color *= ColorModulator;
+    if (color.a < 0.003) {
+        discard;
+    }
+    fragColor = linear_fog(color, vertexDistance, FogStart, FogEnd, FogColor);
+}

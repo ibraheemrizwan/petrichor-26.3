@@ -1,0 +1,11 @@
+{
+  "minecraft": "26.3",
+  "loader": "0.19.5",
+  "fabric_api": "0.161.0+26.3",
+  "java": 25,
+  "server_tests": 31,
+  "suite_server_tests": 136,
+  "release": "1.7.0+26.3.port.1",
+  "artifact": "petrichor-fabric-26.3-1.7.0+26.3.port.1.jar",
+  "sha256": "1bfe95c9a15b3e524f829f3ff9337ac86ac84d77bc0ba7451d7ef74222b21673"
+}
